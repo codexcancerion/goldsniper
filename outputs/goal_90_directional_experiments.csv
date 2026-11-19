@@ -1,0 +1,9 @@
+timeframe,target,model,accuracy_100pct_coverage,accuracy_high_conviction,high_conviction_coverage_pct,n_test
+Daily,Daily_SMA10d_Trend_Direction,LogisticRegression_WalkForward,91.07,93.33,91.8,392
+Daily,Daily_EMA10d_Regime_State,LogisticRegression_WalkForward,79.85,84.46,87.0,392
+Daily,Daily_SMA20d_Trend_Direction,LogisticRegression_WalkForward,94.64,96.46,93.6,392
+Daily,Daily_EMA20d_Regime_State,LogisticRegression_WalkForward,86.48,89.77,89.8,392
+Weekly,Weekly_SMA8w_Trend_Direction,LogisticRegression_WalkForward,91.46,94.81,93.9,82
+Weekly,Weekly_EMA8w_Regime_State,LogisticRegression_WalkForward,85.37,88.31,93.9,82
+Weekly,Weekly_SMA12w_Trend_Direction,LogisticRegression_WalkForward,95.12,96.15,95.1,82
+Weekly,Weekly_EMA12w_Regime_State,LogisticRegression_WalkForward,90.24,93.59,95.1,82

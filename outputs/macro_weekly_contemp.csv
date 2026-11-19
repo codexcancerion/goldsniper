@@ -1,0 +1,5 @@
+timeframe,macro,label,level_pearson_r,level_spearman_rho,ret_pearson_r,ret_p_value,ret_spearman_rho,roll_26w_min,roll_26w_median,roll_26w_max,granger_best_lag,granger_min_p
+Weeks,silver,Silver (SI=F),0.9558,0.9661,0.7699,0.0,0.7876,0.514,0.731,0.912,2,0.4739
+Weeks,dxy,USD Index (DXY),-0.4877,-0.4526,-0.3726,0.0,-0.3793,-0.754,-0.383,-0.038,2,0.0919
+Weeks,us10y,10Y Yield (^TNX),0.5199,0.6504,-0.2203,0.000335,-0.2632,-0.749,-0.33,0.525,1,0.1546
+Weeks,oil,WTI Oil (CL=F),-0.211,-0.3451,0.071,0.252716,0.1098,-0.313,0.192,0.568,2,0.1853
