@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.1.0] - 2026-11-22
+
+### Added
+- **Auto-Polling Live Intraday Quote Strip (`app.py`)**:
+  - Added `fetch_live_gold_quote()` and `_render_live_quote_body()` inside a Streamlit `st.fragment(run_every=...)` loop with configurable intervals (`Off`, `15 sec`, `30 sec`, `60 sec`) and manual poll trigger, displaying current `GC=F` session price, intraday high-low range, contract volume, and real-time spread to the model target without retraining settled daily models.
+- **Incremental Delta Ingestion & Concurrent Market Sync (`fetch_gold_5y_daily.py`, `fetch_macro_5y_daily.py`, `run_pipeline.py`)**:
+  - Upgraded Gold and 12-series macro ingestion to fetch bounded `period1`/`period2` deltas with a 7-day settlement overlap window, concurrent 6-worker macro downloads, and `--full` flag overrides.
+  - Added in-process `sync_market_data()` in `app.py` with a `Force Full 5-Year Refetch` option, cutting market refresh time from multi-second full pulls to under one second on incremental runs.
+- **Expanded Verification Suite (`tests/test_goldsniper.py`)**:
+  - Added `test_forecast_figure_tooltip_and_default_3m`, `test_incremental_gold_merge`, and `test_incremental_macro_merge`.
+
+### Changed
+- **Default 3M Chart Window & Tooltip Clarity (`app.py`)**:
+  - Extracted `build_forecast_figure()` and set the initial x-axis window to `3M` when `Full 5-Year History` is unchecked without restricting y-axis rescaling on `6M`, `1Y`, or `All`.
+  - Separated the green dashed anchor connector (`hoverinfo="skip"`) from the `Live Target` star marker so hovering on the latest settled close no longer duplicates `Actual Close`.
+- **Refreshed Market Datasets (`data/`)**:
+  - Synchronized Gold Futures (`GC=F`), 12 macroeconomic series, cleaned trading/business-day datasets, and daily/weekly feature matrices through `2026-11-20`.
+
+---
+
 ## [1.0.0] - 2026-11-19
 
 ### Added

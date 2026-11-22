@@ -114,6 +114,96 @@ def test_app_ui_strings_no_em_dashes_or_parentheses():
     assert not violations, f"Found forbidden em dashes or parentheses in app.py strings: {violations}"
 
 
+def test_forecast_figure_tooltip_and_default_3m():
+    import sys
+    if str(BASE_DIR) not in sys.path:
+        sys.path.insert(0, str(BASE_DIR))
+    import app
+
+    daily_df = pd.read_csv(DATA_DIR / "gold_daily_features.csv", parse_dates=["date"]).set_index("date").sort_index()
+    fsets = app.get_feature_sets(daily_df, is_daily=True)
+    cols = fsets["GDX Cross-Market Lead"]
+    pred_df, _, live_info = app.run_walk_forward_and_live(
+        daily_df, cols, "HistGBR", horizon=1, is_daily=True
+    )
+
+    fig_3m = app.build_forecast_figure(
+        daily_df, pred_df, live_info, is_daily=True, show_ci=True, show_naive=False, show_full_history=False
+    )
+
+    target_traces = [t for t in fig_3m.data if getattr(t, "name", None) and str(t.name).startswith("Live Target:")]
+    assert len(target_traces) == 1
+    assert len(target_traces[0].x) == 1
+    assert pd.Timestamp(target_traces[0].x[0]) == pd.Timestamp(live_info["target_date"])
+
+    connector_traces = [
+        t for t in fig_3m.data
+        if getattr(t, "legendgroup", None) == "live_target" and getattr(t, "showlegend", True) is False
+    ]
+    assert len(connector_traces) == 1
+    assert connector_traces[0].hoverinfo == "skip"
+    assert [pd.Timestamp(x) for x in connector_traces[0].x] == [
+        pd.Timestamp(live_info["anchor_date"]),
+        pd.Timestamp(live_info["target_date"]),
+    ]
+
+    assert fig_3m.layout.xaxis.range is not None
+    r_start = pd.Timestamp(fig_3m.layout.xaxis.range[0])
+    r_end = pd.Timestamp(fig_3m.layout.xaxis.range[1])
+    span_days = (r_end - r_start).days
+    assert 85 <= span_days <= 105, f"Unexpected 3M range span: {span_days} days"
+
+    fig_full = app.build_forecast_figure(
+        daily_df, pred_df, live_info, is_daily=True, show_ci=True, show_naive=False, show_full_history=True
+    )
+    assert fig_full.layout.xaxis.range is None
+
+
+def test_incremental_gold_merge():
+    import sys
+    if str(BASE_DIR) not in sys.path:
+        sys.path.insert(0, str(BASE_DIR))
+    import fetch_gold_5y_daily
+
+    existing = [
+        {"date": "2026-11-17", "open": 3859.5, "high": 3894.0, "low": 3839.2, "close": 3864.2, "volume": 160399, "source": "yahoo_gc_f"},
+        {"date": "2026-11-18", "open": 3855.2, "high": 3859.3, "low": 3721.8, "close": 3741.9, "volume": 160399, "source": "yahoo_gc_f"},
+    ]
+    incoming = [
+        {"date": "2026-11-18", "open": 3855.2, "high": 3859.3, "low": 3721.8, "close": 3742.1, "volume": 244253, "source": "yahoo_gc_f"},
+        {"date": "2026-11-19", "open": 3730.3, "high": 3759.5, "low": 3620.6, "close": 3685.5, "volume": 203702, "source": "yahoo_gc_f"},
+    ]
+    merged = fetch_gold_5y_daily.merge_gold_rows(existing, incoming)
+    assert [r["date"] for r in merged] == ["2026-11-17", "2026-11-18", "2026-11-19"]
+    assert merged[0]["close"] == 3864.2
+    assert merged[1]["close"] == 3742.1
+    assert merged[1]["volume"] == 244253
+    assert merged[2]["close"] == 3685.5
+
+
+def test_incremental_macro_merge():
+    import sys
+    if str(BASE_DIR) not in sys.path:
+        sys.path.insert(0, str(BASE_DIR))
+    import fetch_macro_5y_daily
+
+    existing = pd.Series(
+        [103.49, 103.86],
+        index=pd.to_datetime(["2026-11-17", "2026-11-18"]),
+        dtype=float,
+    )
+    incoming = pd.Series(
+        [103.90, 104.12],
+        index=pd.to_datetime(["2026-11-18", "2026-11-19"]),
+        dtype=float,
+    )
+    merged = fetch_macro_5y_daily.merge_macro_series(existing, incoming)
+    assert list(merged.index.strftime("%Y-%m-%d")) == ["2026-11-17", "2026-11-18", "2026-11-19"]
+    assert float(merged.loc["2026-11-17"]) == 103.49
+    assert float(merged.loc["2026-11-18"]) == 103.90
+    assert float(merged.loc["2026-11-19"]) == 104.12
+
+
 if __name__ == "__main__":
     for fn in [
         test_required_files_exist,
@@ -121,6 +211,9 @@ if __name__ == "__main__":
         test_feature_tables_leak_free_shift,
         test_walk_forward_engine_accuracy,
         test_app_ui_strings_no_em_dashes_or_parentheses,
+        test_forecast_figure_tooltip_and_default_3m,
+        test_incremental_gold_merge,
+        test_incremental_macro_merge,
     ]:
         fn()
         print(f"[PASSED] {fn.__name__}")

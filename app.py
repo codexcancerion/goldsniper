@@ -5,9 +5,13 @@ Publish-ready Streamlit dashboard with clean storytelling, high-signal metrics, 
 
 from __future__ import annotations
 
-import subprocess
-import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import json
 from pathlib import Path
+import sys
+import time
+import urllib.request
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -32,6 +36,13 @@ SUMMARY_CSV = OUT_DIR / "goal_90_accuracy_summary.csv"
 TREND_CSV = OUT_DIR / "goal_90_directional_experiments.csv"
 
 TEST_START = pd.Timestamp("2025-05-01")
+LIVE_QUOTE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=1d&interval=1m"
+LIVE_POLL_OPTIONS = {
+    "Off": None,
+    "15 sec": 15,
+    "30 sec": 30,
+    "60 sec": 60,
+}
 
 HORIZON_MAP = {
     "Daily 1-Day": ("Daily_1d", True, 1),
@@ -449,6 +460,332 @@ def build_clean_macro_table(gold_clean: pd.DataFrame, macro_df: pd.DataFrame) ->
     return clean
 
 
+def sync_market_data(full_rebuild: bool = False) -> dict:
+    """Refresh Gold and macro datasets incrementally or in full, then rebuild clean and feature CSVs."""
+    base_str = str(BASE_DIR)
+    if base_str not in sys.path:
+        sys.path.insert(0, base_str)
+
+    import build_gold_features
+    import clean_gold_data
+    import fetch_gold_5y_daily
+    import fetch_macro_5y_daily
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        gold_fut = pool.submit(fetch_gold_5y_daily.refresh_gold_data, full=full_rebuild)
+        macro_fut = pool.submit(fetch_macro_5y_daily.refresh_macro_data, full=full_rebuild, verbose=False)
+        gold_res = gold_fut.result()
+        macro_res = macro_fut.result()
+
+    clean_gold_data.clean_gold_data()
+    build_gold_features.main()
+    st.cache_data.clear()
+
+    return {
+        "mode": gold_res["mode"],
+        "elapsed_s": time.perf_counter() - t0,
+        "gold_added": gold_res["added_rows"],
+        "gold_fetched": gold_res["fetched_rows"],
+        "latest_date": gold_res["end_date"],
+        "macro_ok": macro_res["all_ok"],
+    }
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_live_gold_quote() -> dict | None:
+    """Fetch latest intraday or last-traded GC=F quote metadata from Yahoo Finance."""
+    try:
+        req = urllib.request.Request(
+            LIVE_QUOTE_URL,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+
+        meta = payload["chart"]["result"][0]["meta"]
+        price_raw = meta.get("regularMarketPrice")
+        if price_raw is None:
+            return None
+        price = float(price_raw)
+        prev_raw = meta.get("chartPreviousClose")
+        if prev_raw is None:
+            prev_raw = meta.get("previousClose")
+        prev_close = float(prev_raw) if prev_raw is not None else price
+
+        day_high_raw = meta.get("regularMarketDayHigh")
+        day_low_raw = meta.get("regularMarketDayLow")
+        vol_raw = meta.get("regularMarketVolume")
+        market_ts = meta.get("regularMarketTime")
+
+        change_usd = price - prev_close
+        change_pct = ((price / prev_close) - 1.0) * 100.0 if prev_close else 0.0
+
+        if market_ts is not None:
+            dt_utc = datetime.fromtimestamp(int(market_ts), tz=timezone.utc)
+            quote_time_utc = dt_utc.strftime("%Y-%m-%d %H:%M UTC")
+            age_minutes = max(0.0, (datetime.now(timezone.utc) - dt_utc).total_seconds() / 60.0)
+            is_active = age_minutes <= 30.0
+        else:
+            quote_time_utc = "Unavailable"
+            is_active = False
+
+        return {
+            "price": price,
+            "prev_close": prev_close,
+            "change_usd": change_usd,
+            "change_pct": change_pct,
+            "day_high": float(day_high_raw) if day_high_raw is not None else None,
+            "day_low": float(day_low_raw) if day_low_raw is not None else None,
+            "volume": int(vol_raw) if vol_raw is not None else None,
+            "quote_time_utc": quote_time_utc,
+            "is_active": is_active,
+        }
+    except Exception:
+        return None
+
+
+def _render_live_quote_body(
+    pred_close: float,
+    anchor_close: float,
+    target_date: str,
+    poll_label: str,
+) -> None:
+    """Render the auto-polling live COMEX Gold intraday quote strip."""
+    with st.container(border=True):
+        quote = fetch_live_gold_quote()
+        if quote is None:
+            c_msg, c_btn = st.columns([4, 1])
+            c_msg.caption(
+                "Live intraday quote feed is temporarily unavailable. Settled daily forecast data remains active below."
+            )
+            if c_btn.button("⚡ Retry Quote", use_container_width=True):
+                fetch_live_gold_quote.clear()
+                st.rerun(scope="fragment")
+            return
+
+        gap_usd = pred_close - quote["price"]
+        gap_pct = ((pred_close / quote["price"]) - 1.0) * 100.0 if quote["price"] else 0.0
+
+        if quote["day_low"] is not None and quote["day_high"] is not None:
+            range_str = f"${quote['day_low']:,.2f} to ${quote['day_high']:,.2f}"
+        else:
+            range_str = f"Anchor ${anchor_close:,.2f}"
+
+        vol_str = (
+            f"Volume {quote['volume']:,} contracts"
+            if quote["volume"] is not None
+            else f"Prev Close ${quote['prev_close']:,.2f}"
+        )
+
+        q1, q2, q3, q4 = st.columns([1.3, 1.3, 1.3, 1.1])
+        q1.metric(
+            label="Live COMEX Gold Quote",
+            value=f"${quote['price']:,.2f}",
+            delta=f"{quote['change_usd']:+,.2f} USD  /  {quote['change_pct']:+.2f}% Session",
+            help="Latest GC=F Futures market quote polled from Yahoo Finance without modifying the settled daily ML model.",
+        )
+        q2.metric(
+            label="Session Range",
+            value=range_str,
+            delta=vol_str,
+            help="Intraday low-to-high range and traded contract volume for the active or most recent GC=F session.",
+        )
+        q3.metric(
+            label=f"Gap to {target_date} Target",
+            value=f"{gap_usd:+,.2f} USD",
+            delta=f"{gap_pct:+.2f}% vs Live Quote",
+            help="Spread between GoldSniper's settled-close target forecast and the current live GC=F market quote.",
+        )
+        with q4:
+            status_text = "🟢 **Live Session Feed**" if quote["is_active"] else "🟡 **Market Closed or Last Quote**"
+            st.markdown(status_text)
+            st.caption(f"Updated {quote['quote_time_utc']}  |  Poll: {poll_label}")
+            if st.button("⚡ Poll Quote", use_container_width=True):
+                fetch_live_gold_quote.clear()
+                st.rerun(scope="fragment")
+
+
+def build_forecast_figure(
+    active_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    live_info: dict,
+    is_daily: bool,
+    show_ci: bool,
+    show_naive: bool,
+    show_full_history: bool,
+) -> go.Figure:
+    """Build the two-panel GoldSniper forecast and error chart with clean Live Target hover and default 3M zoom."""
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.07,
+        row_heights=[0.74, 0.26],
+        subplot_titles=(
+            "Actual Settled Close vs GoldSniper Out-of-Sample Forecast",
+            "Walk-Forward Forecast Error in USD",
+        ),
+    )
+
+    if show_full_history:
+        train_hist = active_df[active_df.index < TEST_START]
+        fig.add_trace(
+            go.Scatter(
+                x=train_hist.index,
+                y=train_hist["close"],
+                mode="lines",
+                name="Training History",
+                line=dict(color="#718096", width=1.4),
+            ),
+            row=1,
+            col=1,
+        )
+
+    if show_ci:
+        fig.add_trace(
+            go.Scatter(
+                x=pred_df.index,
+                y=pred_df["CI_High"],
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=pred_df.index,
+                y=pred_df["CI_Low"],
+                mode="lines",
+                line=dict(width=0),
+                fill="tonexty",
+                fillcolor="rgba(255, 193, 7, 0.14)",
+                name="90% Confidence Zone",
+            ),
+            row=1,
+            col=1,
+        )
+
+    if show_naive:
+        fig.add_trace(
+            go.Scatter(
+                x=pred_df.index,
+                y=pred_df["Naive_Baseline"],
+                mode="lines",
+                name="Last Close Baseline",
+                line=dict(color="#9e9e9e", width=1.3, dash="dot"),
+            ),
+            row=1,
+            col=1,
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            x=pred_df.index,
+            y=pred_df["Actual_Close"],
+            mode="lines",
+            name="Actual Close",
+            line=dict(color="#00e5ff", width=2.8),
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=pred_df.index,
+            y=pred_df["Forecast_Close"],
+            mode="lines",
+            name="GoldSniper Forecast",
+            line=dict(color="#ff5252", width=2.2),
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=[pd.Timestamp(live_info["anchor_date"]), pd.Timestamp(live_info["target_date"])],
+            y=[live_info["anchor_close"], live_info["pred_close"]],
+            mode="lines+markers",
+            line=dict(color="#00e676", width=2.8, dash="dash"),
+            marker=dict(size=[7, 0], symbol=["circle", "circle"], color="#00e676"),
+            showlegend=False,
+            legendgroup="live_target",
+            hoverinfo="skip",
+        ),
+        row=1,
+        col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=[pd.Timestamp(live_info["target_date"])],
+            y=[live_info["pred_close"]],
+            mode="markers",
+            name=f"Live Target: ${live_info['pred_close']:,.2f}",
+            legendgroup="live_target",
+            marker=dict(size=15, symbol="star", color="#00e676"),
+            hovertemplate="$%{y:,.2f}",
+        ),
+        row=1,
+        col=1,
+    )
+
+    err_colors = ["#00e676" if d else "#ff5252" for d in pred_df["Direction_Correct"]]
+    fig.add_trace(
+        go.Bar(
+            x=pred_df.index,
+            y=pred_df["Error_USD"],
+            name="Error USD",
+            marker_color=err_colors,
+            opacity=0.8,
+            showlegend=False,
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig.update_layout(
+        height=640,
+        hovermode="x unified",
+        margin=dict(t=105),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.10,
+            xanchor="left",
+            x=0,
+            font=dict(size=13),
+        ),
+        xaxis=dict(
+            rangeselector=dict(
+                y=1.01,
+                buttons=list(
+                    [
+                        dict(count=3, label="3M", step="month", stepmode="backward"),
+                        dict(count=6, label="6M", step="month", stepmode="backward"),
+                        dict(count=1, label="1Y", step="year", stepmode="backward"),
+                        dict(step="all", label="All"),
+                    ]
+                ),
+            )
+        ),
+    )
+
+    if not show_full_history:
+        default_start = pd.Timestamp(live_info["anchor_date"]) - pd.DateOffset(months=3)
+        default_end = pd.Timestamp(live_info["target_date"]) + pd.Timedelta(days=3 if is_daily else 10)
+        fig.update_xaxes(range=[default_start, default_end])
+
+    fig.update_yaxes(title_text="USD per Troy Ounce", row=1, col=1)
+    fig.update_yaxes(title_text="Error USD", row=2, col=1)
+    return fig
+
+
 def main() -> None:
     daily_df, weekly_df, gold_clean, macro_df, summary_df, trend_df = load_datasets()
 
@@ -509,17 +846,38 @@ def main() -> None:
         )
 
         st.divider()
+        st.subheader("Live Feed and Sync")
+        poll_label = st.selectbox(
+            "Live Quote Auto-Poll",
+            options=list(LIVE_POLL_OPTIONS.keys()),
+            index=2,
+            help="Auto-refreshes the live intraday GC=F quote strip on a background timer without retraining the settled-close forecast models.",
+        )
+        force_full = st.checkbox(
+            "Force Full 5-Year Refetch",
+            value=False,
+            help="Re-downloads the entire 5-year history instead of fetching only the latest delta days.",
+        )
         if st.button(
-            "🔄 Refresh Live Market Data",
+            "🔄 Sync Latest Market Data",
             use_container_width=True,
-            help="Fetches the latest settled daily closes from Yahoo Finance for Gold and all 12 macroeconomic series, cleans anomalies, and rebuilds the leak-free feature tables.",
+            help="Incrementally fetches recent settled closes from Yahoo Finance for Gold and all 12 macroeconomic series, cleans anomalies, and rebuilds the leak-free feature tables.",
         ):
-            with st.spinner("Synchronizing 5-year market data from Yahoo Finance..."):
-                for script in ["fetch_gold_5y_daily.py", "fetch_macro_5y_daily.py", "clean_gold_data.py", "build_gold_features.py"]:
-                    subprocess.run([sys.executable, str(BASE_DIR / script)], check=False)
-                st.cache_data.clear()
-            st.success("GoldSniper datasets refreshed.")
+            spinner_label = (
+                "Rebuilding full 5-year market data from Yahoo Finance..."
+                if force_full
+                else "Syncing latest market data deltas from Yahoo Finance..."
+            )
+            with st.spinner(spinner_label):
+                sync_res = sync_market_data(full_rebuild=force_full)
+            st.session_state["last_sync_msg"] = (
+                f"Synced {sync_res['mode']} update in {sync_res['elapsed_s']:.1f}s: "
+                f"{sync_res['gold_added']:+d} net new Gold days through {sync_res['latest_date']}."
+            )
             st.rerun()
+
+        if st.session_state.get("last_sync_msg"):
+            st.success(st.session_state.pop("last_sync_msg"))
 
     cols = fsets[fset_choice]
     pred_df, metrics, live_info = run_walk_forward_and_live(
@@ -559,6 +917,13 @@ def main() -> None:
         help="Measures how accurately GoldSniper predicts the causal moving-average trend slope from prior-period data, along with the percentage RMSE reduction versus the naive baseline.",
     )
 
+    st.fragment(run_every=LIVE_POLL_OPTIONS[poll_label])(_render_live_quote_body)(
+        live_info["pred_close"],
+        live_info["anchor_close"],
+        live_info["target_date"],
+        poll_label,
+    )
+
     tab1, tab2, tab3, tab4 = st.tabs(
         [
             "📈 Live Forecast Story",
@@ -582,151 +947,15 @@ def main() -> None:
             ),
         )
 
-        fig = make_subplots(
-            rows=2,
-            cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.07,
-            row_heights=[0.74, 0.26],
-            subplot_titles=(
-                "Actual Settled Close vs GoldSniper Out-of-Sample Forecast",
-                "Walk-Forward Forecast Error in USD",
-            ),
+        fig = build_forecast_figure(
+            active_df,
+            pred_df,
+            live_info,
+            is_daily,
+            show_ci,
+            show_naive,
+            show_full_history,
         )
-
-        if show_full_history:
-            train_hist = active_df[active_df.index < TEST_START]
-            fig.add_trace(
-                go.Scatter(
-                    x=train_hist.index,
-                    y=train_hist["close"],
-                    mode="lines",
-                    name="Training History",
-                    line=dict(color="#718096", width=1.4),
-                ),
-                row=1,
-                col=1,
-            )
-
-        if show_ci:
-            fig.add_trace(
-                go.Scatter(
-                    x=pred_df.index,
-                    y=pred_df["CI_High"],
-                    mode="lines",
-                    line=dict(width=0),
-                    showlegend=False,
-                    hoverinfo="skip",
-                ),
-                row=1,
-                col=1,
-            )
-            fig.add_trace(
-                go.Scatter(
-                    x=pred_df.index,
-                    y=pred_df["CI_Low"],
-                    mode="lines",
-                    line=dict(width=0),
-                    fill="tonexty",
-                    fillcolor="rgba(255, 193, 7, 0.14)",
-                    name="90% Confidence Zone",
-                ),
-                row=1,
-                col=1,
-            )
-
-        if show_naive:
-            fig.add_trace(
-                go.Scatter(
-                    x=pred_df.index,
-                    y=pred_df["Naive_Baseline"],
-                    mode="lines",
-                    name="Last Close Baseline",
-                    line=dict(color="#9e9e9e", width=1.3, dash="dot"),
-                ),
-                row=1,
-                col=1,
-            )
-
-        fig.add_trace(
-            go.Scatter(
-                x=pred_df.index,
-                y=pred_df["Actual_Close"],
-                mode="lines",
-                name="Actual Close",
-                line=dict(color="#00e5ff", width=2.8),
-            ),
-            row=1,
-            col=1,
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=pred_df.index,
-                y=pred_df["Forecast_Close"],
-                mode="lines",
-                name="GoldSniper Forecast",
-                line=dict(color="#ff5252", width=2.2),
-            ),
-            row=1,
-            col=1,
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=[pd.Timestamp(live_info["anchor_date"]), pd.Timestamp(live_info["target_date"])],
-                y=[live_info["anchor_close"], live_info["pred_close"]],
-                mode="lines+markers",
-                name=f"Live Target: ${live_info['pred_close']:,.2f}",
-                line=dict(color="#00e676", width=2.8, dash="dash"),
-                marker=dict(size=[8, 15], symbol=["circle", "star"], color="#00e676"),
-            ),
-            row=1,
-            col=1,
-        )
-
-        err_colors = ["#00e676" if d else "#ff5252" for d in pred_df["Direction_Correct"]]
-        fig.add_trace(
-            go.Bar(
-                x=pred_df.index,
-                y=pred_df["Error_USD"],
-                name="Error USD",
-                marker_color=err_colors,
-                opacity=0.8,
-                showlegend=False,
-            ),
-            row=2,
-            col=1,
-        )
-
-        fig.update_layout(
-            height=640,
-            hovermode="x unified",
-            margin=dict(t=105),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.10,
-                xanchor="left",
-                x=0,
-                font=dict(size=13),
-            ),
-            xaxis=dict(
-                rangeselector=dict(
-                    y=1.01,
-                    buttons=list(
-                        [
-                            dict(count=3, label="3M", step="month", stepmode="backward"),
-                            dict(count=6, label="6M", step="month", stepmode="backward"),
-                            dict(count=1, label="1Y", step="year", stepmode="backward"),
-                            dict(step="all", label="All"),
-                        ]
-                    ),
-                )
-            ),
-        )
-        fig.update_yaxes(title_text="USD per Troy Ounce", row=1, col=1)
-        fig.update_yaxes(title_text="Error USD", row=2, col=1)
         st.plotly_chart(fig, use_container_width=True)
 
         col_a, col_b = st.columns([1, 2])

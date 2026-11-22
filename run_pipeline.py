@@ -36,14 +36,15 @@ ANALYTICS_STEPS = [
 ]
 
 
-def run_step(title: str, script_name: str) -> bool:
+def run_step(title: str, script_name: str, extra_args: list[str] | None = None) -> bool:
     script_path = BASE_DIR / script_name
+    cmd = [sys.executable, str(script_path), *(extra_args or [])]
     print(f"\n{'=' * 78}")
     print(f"[GoldSniper] Running {title}")
-    print(f"Script: {script_path.name}")
+    print(f"Script: {script_path.name}" + (f" {' '.join(extra_args)}" if extra_args else ""))
     print(f"{'=' * 78}")
     t0 = time.perf_counter()
-    res = subprocess.run([sys.executable, str(script_path)], cwd=str(BASE_DIR), check=False)
+    res = subprocess.run(cmd, cwd=str(BASE_DIR), check=False)
     elapsed = time.perf_counter() - t0
     status = "OK" if res.returncode == 0 else f"FAILED (exit code {res.returncode})"
     print(f"[GoldSniper] Completed {script_name} -> {status} in {elapsed:.2f}s")
@@ -57,6 +58,11 @@ def main() -> int:
         action="store_true",
         help="Run only data ingestion, cleaning, and feature engineering steps.",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Force a full 5-year refetch instead of incremental delta updates.",
+    )
     args = parser.parse_args()
 
     steps = DATA_STEPS if args.data_only else (DATA_STEPS + ANALYTICS_STEPS)
@@ -66,8 +72,10 @@ def main() -> int:
     print("  GoldSniper: Reproducible Gold Futures Data & Walk-Forward Forecasting Suite ")
     print("==============================================================================")
 
+    fetch_scripts = {"fetch_gold_5y_daily.py", "fetch_macro_5y_daily.py"}
     for title, script in steps:
-        if not run_step(title, script):
+        extra = ["--full"] if (args.full and script in fetch_scripts) else None
+        if not run_step(title, script, extra_args=extra):
             print(f"\n[GoldSniper] Pipeline halted due to failure in {script}.")
             return 1
 
